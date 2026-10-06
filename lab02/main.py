@@ -5,6 +5,7 @@ import sys
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+from scipy.ndimage import binary_fill_holes
 
 sys.setrecursionlimit(1000000)
 
@@ -36,15 +37,17 @@ def custom_filter(img, kernel):
 ###
 
 def custom_fill(img, labels, x, y, L):
-    h, w = img.shape
-    if x < 0 or x >= w or y < 0 or y >= h:
-        return
     if labels[y, x] == 0 and img[y, x] == 1:
         labels[y, x] = L
-        custom_fill(img, labels, x - 1, y, L)
-        custom_fill(img, labels, x + 1, y, L)
-        custom_fill(img, labels, x, y - 1, L)
-        custom_fill(img, labels, x, y + 1, L)
+        h, w = img.shape
+        if x > 0:
+             custom_fill(img, labels, x - 1, y, L)
+        if x < w - 1:
+            custom_fill(img, labels, x + 1, y, L)
+        if y > 0:
+            custom_fill(img, labels, x, y - 1, L)
+        if y < h - 1:
+             custom_fill(img, labels, x, y + 1, L)
 
 def custom_labeling(binary_img):
     img_bin = (binary_img > 0).astype(np.uint8)
@@ -58,31 +61,6 @@ def custom_labeling(binary_img):
                 custom_fill(img_bin, labels, x, y, L)
                 L += 1
     return labels
-
-def custom_find_contours(binary_img):
-    labels_img = custom_labeling(binary_img)
-    unique_labels = np.unique(labels_img)
-
-    contours = []
-    for L in unique_labels:
-        if L == 0:
-            continue
-        obj_mask = (labels_img == L).astype(np.uint8) * 255
-        cnts, _ = cv2.findContours(obj_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if cnts:
-            contours.append(max(cnts, key=cv2.contourArea))
-
-    return contours, None
-
-def custom_hsv_threshold(bgr_img):
-    hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
-    hue = hsv[:, :, 0]
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-
-    foreground_seed = (hue >= 35) & (hue <= 135) & (sat > 45) & (val > 40)
-    raw_mask = foreground_seed.astype(np.uint8) * 255
-    return raw_mask
 
 def custom_kmeans(data, k):
     np.random.seed(676767)
@@ -111,34 +89,24 @@ def custom_kmeans(data, k):
     compactness = float(np.sum(np.min(distances, axis=1) ** 2))
     return compactness, labels.reshape(-1, 1), centroids
 
-def compute_features_from_contours(contours):
-    valid_contours = []
-    features = []
+def feature_area(mask):
+    return int(np.count_nonzero(mask))
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        perimeter = cv2.arcLength(cnt, True)
+def feature_perimeter(mask):
+    p = np.pad(mask, 1, constant_values=False)
+    neighbor_is_bg = (
+        ~p[:-2, 1:-1] |   # верх
+        ~p[2:,  1:-1] |   # низ
+        ~p[1:-1, :-2] |   # лево
+        ~p[1:-1, 2:]      # право
+    )
+    return int(np.count_nonzero(mask & neighbor_is_bg))
 
-        M = cv2.moments(cnt)
-        if M["m00"] == 0:
-            continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-
-        compactness = (perimeter ** 2) / (4 * np.pi * area) if area > 0 else 0
-
-        if len(cnt) >= 5:
-            (x, y), (MA, ma), angle = cv2.fitEllipse(cnt)
-            elongation = max(MA, ma) / min(MA, ma) if min(MA, ma) > 0 else 0
-        else:
-            x, y, w, h = cv2.boundingRect(cnt)
-            elongation = max(w, h) / min(w, h) if min(w, h) > 0 else 0
-
-        features.append([area, perimeter, compactness, elongation])
-        valid_contours.append((cnt, cx, cy))
-
-    features = np.array(features, dtype=np.float32)
-    return features, valid_contours
+def feature_centroid(mask):
+    ys, xs = np.where(mask)
+    cx = float(np.mean(xs))
+    cy = float(np.mean(ys))
+    return cx, cy
 
 def cluster_features(features, k, method='custom'):
     n = len(features)
@@ -161,51 +129,91 @@ def cluster_features(features, k, method='custom'):
         _, labels, _ = cv2.kmeans(normalized, actual_k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
     return labels.flatten()
 
-def render_clusters(rgb, valid_contours, labels):
-    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # Красный, Зелёный, Синий
+def render_clusters(rgb, object_masks, labels):
+    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
     img = np.zeros_like(rgb)
 
-    for i, (cnt, cx, cy) in enumerate(valid_contours):
+    for i, mask in enumerate(object_masks):
         label = int(labels[i]) if i < len(labels) else 0
-        color = colors[label % 3]
-
-        cv2.drawContours(img, [cnt], -1, color, thickness=cv2.FILLED)
-        cv2.drawContours(img, [cnt], -1, (255, 255, 255), 2)
-        cv2.circle(img, (cx, cy), 4, (255, 255, 255), -1)
-        cv2.putText(img, f"C{label}", (cx - 10, cy + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        img[mask] = colors[label % 3]
 
     return img
 
-def extract_features_and_cluster(rgb, mask):
-    (contours, _) = custom_find_contours(mask)
-    # (contours, _) = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def custom_hsv_threshold(rgb_img):
+    hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
 
-    features, valid_contours = compute_features_from_contours(contours)
+    # mask = (hue >= 35) & (hue <= 135) & (sat > 45) & (val > 40) # кубики
+    mask = (hue >= 35) & (hue <= 91) & (sat > 40) & (val > 40) # цифры
 
-    if len(valid_contours) == 0:
-        empty = np.zeros_like(rgb)
-        return empty, empty, "No objects found"
+    return mask.astype(np.uint8) * 255
+
+###
+
+def extract_features_and_cluster(cleaned):
+
+    binary_mask = custom_hsv_threshold(cleaned)
+
+    processed_mask = cv2.dilate(binary_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
+
+    _, labels_cc, stats, _ = cv2.connectedComponentsWithStats(processed_mask, connectivity=8)
+    min_area = (cleaned.shape[0] * cleaned.shape[1]) * 0.002
+    keep = np.where(stats[:, cv2.CC_STAT_AREA] >= min_area)[0]
+    keep = keep[keep != 0]
+    processed_mask = np.isin(labels_cc, keep).astype(np.uint8) * 255
+
+    ###
+
+    labels_img = custom_labeling(processed_mask)
+    unique_labels = np.unique(labels_img)
+
+    features_list = []
+    object_masks = []
+
+    for L in unique_labels:
+        if L == 0:
+            continue
+        obj_mask = (labels_img == L)
+
+        obj_mask = binary_fill_holes(obj_mask) # ? заливка
+
+        area = feature_area(obj_mask)
+        perimeter = feature_perimeter(obj_mask)
+        centroid_x, centroid_y = feature_centroid(obj_mask)
+        compactness = (perimeter ** 2) / area if area > 0 else 0
+
+        features_list.append([area, perimeter, centroid_x, centroid_y, compactness])
+
+        object_masks.append(obj_mask)
+
+    if len(object_masks) == 0:
+        empty = np.zeros_like(cleaned)
+        return binary_mask, processed_mask, empty, empty, "No objects found"
+
+    ###
+
+    features = np.array(features_list, dtype=np.float32)
 
     labels_custom = cluster_features(features, 3, method='custom')
     labels_lib = cluster_features(features, 3, method='lib')
 
-
-    clustered_custom = render_clusters(rgb, valid_contours, labels_custom)
-    clustered_lib = render_clusters(rgb, valid_contours, labels_lib)
+    clustered_custom = render_clusters(cleaned, object_masks, labels_custom)
+    clustered_lib = render_clusters(cleaned, object_masks, labels_lib)
 
     features_str = "Object Features:\n"
-    features_str += (f"{'ID':<4} {'Area':<9} {'Perim':<9} {'Comp':<8} "
-                     f"{'Elong':<8} {'C_cust':<8} {'C_lib':<6}\n")
-    features_str += "-" * 66 + "\n"
+    features_str += (f"{'No':<4} {'Area':<9} {'Perim':<9} {'C_x':<8} {'C_y':<8}"
+                     f"{'Comp':<8} {'C_cust':<8} {'C_lib':<6}\n")
+    features_str += "-" * 64 + "\n"
 
-    for i in range(len(valid_contours)):
+    for i in range(len(object_masks)):
         f = features[i]
         lc = int(labels_custom[i]) if i < len(labels_custom) else 0
         ll = int(labels_lib[i]) if i < len(labels_lib) else 0
-        features_str += (f"{i+1:<4} {f[0]:<9.1f} {f[1]:<9.1f} "
-                         f"{f[2]:<8.2f} {f[3]:<8.2f} {lc:<8} {ll:<6}\n")
-
-    return clustered_custom, clustered_lib, features_str
+        features_str += (f"{i+1:<4} {f[0]:<9.0f} {f[1]:<9.0f} {f[2]:<8.1f} {f[3]:<8.1f}"
+                         f"{f[4]:<8.2f} {lc:<8} {ll:<6}\n")
+    return binary_mask, processed_mask, clustered_custom, clustered_lib, features_str
 
 ###
 
@@ -234,10 +242,31 @@ def process_pipeline(img_path):
     gray_custom = custom_rgb_to_gray(rgb)
     blurred_custom = custom_filter(gray_custom, gaussian_kernel_3x3)
 
-    hsv_binary = custom_hsv_threshold(bgr)
+    gray_lib = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    blurred_lib = cv2.filter2D(gray_lib, -1, gaussian_kernel_3x3, borderType=cv2.BORDER_REFLECT)
+
+    gray_mae = float(np.mean(np.abs(gray_custom.astype(np.float32) - gray_lib.astype(np.float32))))
+    blur_mae = float(np.mean(np.abs(blurred_custom.astype(np.float32) - blurred_lib.astype(np.float32))))
+
+    diff_map = np.abs(gray_custom.astype(np.float32) - blurred_custom.astype(np.float32))
+    diff_denoised = np.maximum(diff_map - 2.0, 0.0)
+    diff_normalized = np.clip((diff_denoised / 8.0) * 255.0, 0, 255).astype(np.uint8)
+
+    grad_x = cv2.Sobel(blurred_custom, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(blurred_custom, cv2.CV_32F, 0, 1, ksize=3)
+    edges = cv2.magnitude(grad_x, grad_y)
+    edges = np.clip(edges, 0, 255).astype(np.uint8)
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    foreground_seed = (hue >= 35) & (hue <= 135) & (sat > 45) & (val > 40)
+    raw_mask = foreground_seed.astype(np.uint8) * 255
 
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed = cv2.morphologyEx(hsv_binary, cv2.MORPH_CLOSE, close_kernel)
+    closed = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, close_kernel)
 
     open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, open_kernel)
@@ -252,14 +281,19 @@ def process_pipeline(img_path):
 
     cleaned = cv2.bitwise_and(rgb, rgb, mask=final_mask)
 
-    clustered_custom, clustered_lib, features_str = extract_features_and_cluster(rgb, final_mask)
+    binary_mask, processed_mask, clustered_custom, clustered_lib, features_str = extract_features_and_cluster(cleaned)
 
     return {
         "rgb": rgb,
         "gray": gray_custom,
-        "hsv_binary": hsv_binary,
-        "final_mask": final_mask,
+        "blurred": blurred_custom,
+        "diff_map": diff_normalized,
+        "edges": edges,
         "cleaned": cleaned,
+        "gray_mae": gray_mae,
+        "blur_mae": blur_mae,
+        "binary_mask" : binary_mask,
+        "processed_mask" : processed_mask,
         "clustered_custom": clustered_custom,
         "clustered_lib": clustered_lib,
         "features_str": features_str,
@@ -274,8 +308,8 @@ class DatasetViewer:
         self.cache = {}
         self.stop_worker = False
 
-
-        self.fig, self.axes = plt.subplots(2, 4, figsize=(22, 11))
+        # 2x4 = 8 слотов
+        self.fig, self.axes = plt.subplots(2, 4, figsize=(20, 12))
         self.fig.canvas.mpl_connect('key_press_event', self.on_key)
 
         first_path = self.image_paths[0]
@@ -304,41 +338,43 @@ class DatasetViewer:
         print(f"[{self.current_idx + 1}/{len(self.image_paths)}] {file_name}")
 
         stages = [
-            ("Original RGB", res["rgb"], None),
-            ("Grayscale", res["gray"], "gray"),
-            ("HSV Binary (raw)", res["hsv_binary"], "gray"),
-            ("Final Mask", res["final_mask"], "gray"),
-            ("Cleaned Output", res["cleaned"], None),
+            ("Original RGB",                res["rgb"],              None),
+            ("Cleaned Output",              res["cleaned"],          None),
+            ("Binary Mask",                 res["binary_mask"],      "gray"),
+            ("Processed Mask",              res["processed_mask"],      "gray"),
             ("Clustering — Custom k-means", res["clustered_custom"], None),
-            ("Clustering — cv2.kmeans", res["clustered_lib"], None),
+            ("Clustering — cv2.kmeans",     res["clustered_lib"],    None),
         ]
 
         self.fig.suptitle(
             f"File: {file_name} ({self.current_idx + 1}/{len(self.image_paths)}) (<- / ->)",
-            fontsize=14, y=0.98
+            fontsize=14, y=0.97
         )
 
         flat_axes = self.axes.flatten()
 
         for ax, (title, img, cmap) in zip(flat_axes, stages):
             ax.clear()
-            ax.set_title(title, fontsize=11, pad=8)
+            ax.set_title(title, fontsize=12, pad=8)
             if cmap is None:
                 ax.imshow(img)
             else:
                 ax.imshow(img, cmap=cmap)
             ax.axis('off')
 
-        # 8-й слот — таблица признаков
-        ax_text = flat_axes[7]
+        # 7-й слот — таблица признаков
+        ax_text = flat_axes[6]
         ax_text.clear()
-        text_block = "Calculated Features\n\n" + res["features_str"]
-        ax_text.text(0.02, 0.5, text_block, fontsize=10, va='center', ha='left', family='monospace')
+        ax_text.text(0.02, 0.5, " " * 18 + "Calculated Features\n\n" + res["features_str"], fontsize=10, va='center', ha='left', family='monospace')
         ax_text.axis('off')
 
-        self.fig.subplots_adjust(top=0.93, bottom=0.04, left=0.03,
-                                 right=0.97, hspace=0.20, wspace=0.08)
+        self.fig.subplots_adjust(top=0.92, bottom=0.04, left=0.03, right=0.97, hspace=0.20, wspace=0.08)
         self.fig.canvas.draw_idle()
+
+        ax_none = flat_axes[7]
+        ax_none.clear()
+        ax_none.axis('off')
+
 
     def on_key(self, event):
         if event.key in ('right', 'd', ' '):
